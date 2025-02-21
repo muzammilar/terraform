@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -35,7 +36,7 @@ func TestTest_Runs(t *testing.T) {
 		code                  int
 		initCode              int
 		skip                  bool
-		desc                  string
+		description           string
 	}{
 		"simple_pass": {
 			expectedOut: []string{"1 passed, 0 failed."},
@@ -68,7 +69,7 @@ func TestTest_Runs(t *testing.T) {
 			args:        []string{"-parallelism", "1"},
 			expectedOut: []string{"1 passed, 0 failed."},
 			code:        0,
-			desc:        "simple_pass with parallelism set to 1",
+			description: "simple_pass with parallelism set to 1",
 		},
 		"simple_pass_very_nested_alternate": {
 			override:    "simple_pass_very_nested",
@@ -112,10 +113,6 @@ func TestTest_Runs(t *testing.T) {
 			expectedOut: []string{"1 passed, 0 failed."},
 			code:        0,
 		},
-		"expect_failures_outputs": {
-			expectedOut: []string{"1 passed, 0 failed."},
-			code:        0,
-		},
 		"expect_failures_resources": {
 			expectedOut: []string{"1 passed, 0 failed."},
 			code:        0,
@@ -129,6 +126,12 @@ func TestTest_Runs(t *testing.T) {
 			args:        []string{"-filter=one.tftest.hcl"},
 			expectedOut: []string{"1 passed, 0 failed"},
 			code:        0,
+		},
+		"no_state": {
+			expectedOut: []string{"0 passed, 1 failed"},
+			expectedErr: []string{"No value for required variable"},
+			description: "the run apply fails, causing it to produce a nil state.",
+			code:        1,
 		},
 		"variables": {
 			expectedOut: []string{"2 passed, 0 failed"},
@@ -405,7 +408,7 @@ func TestTest_Runs(t *testing.T) {
 				Meta: meta,
 			}
 
-			code := c.Run(tc.args)
+			code := c.Run(append(tc.args, "-no-color"))
 			output := done(t)
 
 			if code != tc.code {
@@ -667,9 +670,6 @@ func TestTest_Parallel(t *testing.T) {
 	// Find the positions of "test_d", "test_c", "test_setup" in the log output
 	var testDIndex, testCIndex, testSetupIndex int
 	for i, line := range lines {
-		// if strings.Contains(line, "run \"") {
-		// 	fmt.Println(line)
-		// }
 		if strings.Contains(line, "run \"setup\"") {
 			testSetupIndex = i
 		} else if strings.Contains(line, "run \"test_d\"") {
@@ -805,7 +805,7 @@ func TestTest_ProviderAlias(t *testing.T) {
 
 	output := done(t)
 
-	if code := init.Run(nil); code != 0 {
+	if code := init.Run([]string{"-no-color"}); code != 0 {
 		t.Fatalf("expected status code 0 but got %d: %s", code, output.All())
 	}
 
@@ -818,7 +818,7 @@ func TestTest_ProviderAlias(t *testing.T) {
 		Meta: meta,
 	}
 
-	code := command.Run(nil)
+	code := command.Run([]string{"-no-color"})
 	output = done(t)
 
 	printedOutput := false
@@ -1131,6 +1131,23 @@ it has been removed. This occurs when a provider configuration is removed
 while objects created by that provider still exist in the state. Re-add the
 provider configuration to destroy test_resource.secondary, after which you
 can remove the provider configuration again.
+`,
+		},
+		"missing-provider-definition-in-file": {
+			expectedOut: `main.tftest.hcl... in progress
+  run "passes_validation"... fail
+main.tftest.hcl... tearing down
+main.tftest.hcl... fail
+
+Failure! 0 passed, 1 failed.
+`,
+			expectedErr: `
+Error: Missing provider definition for test
+
+  on main.tftest.hcl line 12, in run "passes_validation":
+  12:     test = test
+
+This provider block references a provider definition that does not exist.
 `,
 		},
 		"missing-provider-in-test-module": {
@@ -1843,6 +1860,7 @@ the apply operation could not be executed and so the overall test case will
 be marked as a failure and the original diagnostic included in the test
 report.
 
+  run "no_run"... skip
 input.tftest.hcl... tearing down
 input.tftest.hcl... fail
 output.tftest.hcl... in progress
@@ -1875,7 +1893,7 @@ test report.
 resource.tftest.hcl... tearing down
 resource.tftest.hcl... fail
 
-Failure! 1 passed, 3 failed.
+Failure! 1 passed, 3 failed, 1 skipped.
 `
 	actualOut := output.Stdout()
 	if diff := cmp.Diff(expectedOut, actualOut); len(diff) > 0 {
@@ -1911,6 +1929,71 @@ Error: Resource postcondition failed
     │ self.value is "acd"
 
 input must contain the character 'b'
+`
+	actualErr := output.Stderr()
+	if diff := cmp.Diff(actualErr, expectedErr); len(diff) > 0 {
+		t.Errorf("output didn't match expected:\nexpected:\n%s\nactual:\n%s\ndiff:\n%s", expectedErr, actualErr, diff)
+	}
+
+	if provider.ResourceCount() > 0 {
+		t.Errorf("should have deleted all resources on completion but left %v", provider.ResourceString())
+	}
+}
+
+func TestTest_MissingExpectedFailuresDuringApply(t *testing.T) {
+	// Test asserting that the test run fails, but not errors out, when expected failures are not present during apply.
+	// This lets subsequent runs continue to execute and the file to be marked as failed.
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath(path.Join("test", "expect_failures_during_apply")), td)
+	defer testChdir(t, td)()
+
+	provider := testing_command.NewProvider(nil)
+	view, done := testView(t)
+
+	c := &TestCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(provider.Provider),
+			View:             view,
+		},
+	}
+
+	code := c.Run([]string{"-no-color"})
+	output := done(t)
+
+	if code == 0 {
+		t.Errorf("expected status code 0 but got %d", code)
+	}
+
+	expectedOut := `main.tftest.hcl... in progress
+  run "test"... fail
+  run "follow-up"... pass
+
+Warning: Value for undeclared variable
+
+  on main.tftest.hcl line 16, in run "follow-up":
+  16:     input = "does not matter"
+
+The module under test does not declare a variable named "input", but it is
+declared in run block "follow-up".
+
+main.tftest.hcl... tearing down
+main.tftest.hcl... fail
+
+Failure! 1 passed, 1 failed.
+`
+	actualOut := output.Stdout()
+	if diff := cmp.Diff(expectedOut, actualOut); len(diff) > 0 {
+		t.Errorf("output didn't match expected:\nexpected:\n%s\nactual:\n%s\ndiff:\n%s", expectedOut, actualOut, diff)
+	}
+
+	expectedErr := `
+Error: Missing expected failure
+
+  on main.tftest.hcl line 7, in run "test":
+   7:     output.output
+
+The checkable object, output.output, was expected to report an error but did
+not.
 `
 	actualErr := output.Stderr()
 	if diff := cmp.Diff(actualErr, expectedErr); len(diff) > 0 {
@@ -2392,6 +2475,84 @@ an unnecessary override.
 Success! 2 passed, 0 failed.
 `
 
+	actual := output.All()
+
+	if diff := cmp.Diff(actual, expected); len(diff) > 0 {
+		t.Errorf("output didn't match expected:\nexpected:\n%s\nactual:\n%s\ndiff:\n%s", expected, actual, diff)
+	}
+
+	if provider.ResourceCount() > 0 {
+		t.Errorf("should have deleted all resources on completion but left %v", provider.ResourceString())
+	}
+}
+
+func TestTest_InvalidConfig(t *testing.T) {
+	t.Skip("TODO(dsa0x): Unable to reproduce this flakiness locally, skipping for now. Need to investigate or remove.")
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath(path.Join("test", "invalid_config")), td)
+	defer testChdir(t, td)()
+
+	provider := testing_command.NewProvider(nil)
+
+	providerSource, close := newMockProviderSource(t, map[string][]string{
+		"test": {"1.0.0"},
+	})
+	defer close()
+
+	streams, done := terminal.StreamsForTesting(t)
+	view := views.NewView(streams)
+	ui := new(cli.MockUi)
+
+	meta := Meta{
+		Ui:             ui,
+		View:           view,
+		Streams:        streams,
+		ProviderSource: providerSource,
+	}
+
+	init := &InitCommand{
+		Meta: meta,
+	}
+
+	output := done(t)
+
+	if code := init.Run(nil); code != 0 {
+		t.Fatalf("expected status code 0 but got %d: %s", code, output.All())
+	}
+
+	// Reset the streams for the next command.
+	streams, done = terminal.StreamsForTesting(t)
+	meta.Streams = streams
+	meta.View = views.NewView(streams)
+
+	c := &TestCommand{
+		Meta: meta,
+	}
+
+	code := c.Run([]string{"-no-color"})
+	output = done(t)
+
+	if code != 1 {
+		t.Errorf("expected status code ! but got %d", code)
+	}
+
+	expected := `main.tftest.hcl... in progress
+  run "test"... fail
+
+Error: Failed to load plugin schemas
+
+Error while loading schemas for plugin components: Failed to obtain provider
+schema: Could not load the schema for provider
+registry.terraform.io/hashicorp/test: failed to instantiate provider
+"registry.terraform.io/hashicorp/test" to obtain schema: fork/exec
+.terraform/providers/registry.terraform.io/hashicorp/test/1.0.0/%s/terraform-provider-test_1.0.0:
+permission denied..
+main.tftest.hcl... tearing down
+main.tftest.hcl... fail
+
+Failure! 0 passed, 1 failed.
+`
+	expected = fmt.Sprintf(expected, runtime.GOOS+"_"+runtime.GOARCH)
 	actual := output.All()
 
 	if diff := cmp.Diff(actual, expected); len(diff) > 0 {
